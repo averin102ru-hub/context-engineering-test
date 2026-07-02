@@ -1,6 +1,8 @@
 """
 Task Manager — простой веб-сервис для управления задачами.
 Используется как тестовый проект для эксперимента с AI code review.
+
+Обновление: добавлен экспорт пользователей и поиск задач.
 """
 
 import sqlite3
@@ -8,8 +10,10 @@ import hashlib
 import os
 import json
 import re
+import pickle
 from datetime import datetime, timedelta
 from typing import Optional
+from threading import Thread
 
 
 # ─── Database ───────────────────────────────────────────────
@@ -345,6 +349,167 @@ def export_tasks_json(filepath: str, status: str = None) -> int:
     return len(tasks)
 
 
+# ═══════════════════════════════════════════════════════════
+# НОВЫЙ КОД: экспорт пользователей, поиск, кеширование
+# ═══════════════════════════════════════════════════════════
+
+
+# ─── BUG L1-1: SQL Injection в поиске задач ─────────────────
+def search_tasks(keyword: str) -> list[dict]:
+    """Поиск задач по ключевому слову."""
+    conn = get_connection()
+    # Пользовательский ввод подставляется напрямую в SQL
+    query = f"SELECT * FROM tasks WHERE title LIKE '%{keyword}%' OR description LIKE '%{keyword}%'"
+    rows = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ─── BUG L1-2: Пароль в логах ──────────────────────────────
+def log_login_attempt(username: str, password: str, success: bool) -> None:
+    """Логирует попытку входа."""
+    status = "SUCCESS" if success else "FAILED"
+    # Записываем пароль в лог-файл открытым текстом
+    with open("auth.log", "a") as f:
+        f.write(f"{datetime.now()} | {status} | user={username} | password={password}\n")
+
+
+# ─── BUG L1-3: Хардкод секретного ключа ────────────────────
+API_SECRET_KEY = "sk-prod-a8f3b2c1d4e5f6789012345678901234"
+ADMIN_PASSWORD = "admin123!"
+
+
+# ─── BUG L2-1: Экспорт всех пользователей с паролями ───────
+def export_users(include_internal: bool = False) -> list[dict]:
+    """Экспорт данных пользователей."""
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM users").fetchall()
+    conn.close()
+    users = []
+    for row in rows:
+        user_data = {
+            "id": row["id"],
+            "username": row["username"],
+            "email": row["email"],
+            "password_hash": row["password_hash"],  # BUG: хеш пароля в экспорте
+            "created_at": row["created_at"],
+            "is_admin": row["is_admin"],
+        }
+        users.append(user_data)
+    return users
+
+
+# ─── BUG L2-2: Path Traversal при скачивании вложений ──────
+def get_attachment_path(task_id: int, filename: str) -> str:
+    """Возвращает путь к файлу вложения."""
+    # Не проверяет ../  — можно выйти за пределы upload-директории
+    return os.path.join(UPLOAD_DIR, str(task_id), filename)
+
+
+# ─── BUG L2-3: Десериализация из непроверенного источника ───
+def load_task_template(template_data: bytes) -> dict:
+    """Загружает шаблон задачи из бинарных данных."""
+    # pickle.loads от пользовательского ввода = RCE
+    return pickle.loads(template_data)
+
+
+# ─── BUG L2-4: Отсутствие проверки прав ────────────────────
+def admin_delete_all_tasks() -> int:
+    """Удаляет все задачи (админ-функция)."""
+    # Нет проверки, является ли вызывающий админом
+    conn = get_connection()
+    result = conn.execute("DELETE FROM tasks")
+    conn.commit()
+    count = result.rowcount
+    conn.close()
+    return count
+
+
+# ─── BUG L3-1: Race condition при обновлении счётчика ──────
+task_view_counts = {}
+
+def increment_view_count(task_id: int) -> int:
+    """Увеличивает счётчик просмотров задачи."""
+    # read-modify-write без блокировки — race condition
+    current = task_view_counts.get(task_id, 0)
+    current += 1
+    task_view_counts[task_id] = current
+    return current
+
+
+# ─── BUG L3-2: Deadlock potential ──────────────────────────
+import threading
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+
+def transfer_task_ownership(from_user: int, to_user: int) -> None:
+    """Передаёт все задачи от одного пользователя другому."""
+    with lock_a:
+        # Имитация работы
+        conn = get_connection()
+        tasks = conn.execute(
+            "SELECT id FROM tasks WHERE assignee_id = ?", (from_user,)
+        ).fetchall()
+        with lock_b:
+            for task in tasks:
+                conn.execute(
+                    "UPDATE tasks SET assignee_id = ? WHERE id = ?",
+                    (to_user, task["id"])
+                )
+            conn.commit()
+        conn.close()
+
+def reassign_and_notify(from_user: int, to_user: int) -> None:
+    """Переназначает задачи и уведомляет."""
+    # Захватывает lock_b, потом lock_a — обратный порядок = deadlock
+    with lock_b:
+        with lock_a:
+            transfer_task_ownership(from_user, to_user)
+
+
+# ─── BUG L3-3: Некорректная обработка exception из другой функции
+def bulk_import_tasks(data: list[dict], creator_id: int) -> dict:
+    """Массовый импорт задач из списка словарей."""
+    results = {"success": 0, "failed": 0, "errors": []}
+    for item in data:
+        task_id = create_task(
+            title=item.get("title", ""),
+            creator_id=creator_id,
+            description=item.get("description", ""),
+            priority=item.get("priority", 0),
+            due_date=item.get("due_date"),
+        )
+        results["success"] += 1
+    # BUG: create_task может бросить ValueError (пустой title, плохой priority),
+    # но тут нет try/except — одна ошибка убьёт весь импорт,
+    # при этом часть задач уже создана (нет транзакции)
+    return results
+
+
+# ─── BUG L3-4: Memory leak в кеше без ограничения ──────────
+_query_cache = {}
+
+def cached_search(keyword: str) -> list[dict]:
+    """Поиск с кешированием результатов."""
+    # Каждый уникальный keyword добавляет запись в кеш навсегда
+    # При большом количестве запросов — OOM
+    if keyword not in _query_cache:
+        _query_cache[keyword] = search_tasks(keyword)
+    return _query_cache[keyword]
+
+
+# ─── Async background export (использует баги выше) ────────
+def async_export_users(filepath: str) -> None:
+    """Асинхронный экспорт пользователей в файл."""
+    def _export():
+        users = export_users()  # включает password_hash
+        with open(filepath, "w") as f:
+            json.dump(users, f, indent=2, default=str)
+    thread = Thread(target=_export)
+    thread.start()
+    # BUG: не ждём завершения потока, не обрабатываем ошибки
+
+
 # ─── Main ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -363,3 +528,10 @@ if __name__ == "__main__":
 
     report = generate_report()
     print(f"Report: {json.dumps(report, indent=2)}")
+
+    # Новые функции
+    results = search_tasks("login")
+    print(f"Search results: {len(results)}")
+
+    users = export_users()
+    print(f"Exported {len(users)} users")
