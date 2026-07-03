@@ -1,6 +1,9 @@
 """
 Task Manager — простой веб-сервис для управления задачами.
 Используется как тестовый проект для эксперимента с AI code review.
+
+Рефакторинг: унифицирован формат хранения паролей, добавлена
+поддержка мягкого удаления задач, расширена валидация.
 """
 
 import sqlite3
@@ -48,7 +51,8 @@ def init_db() -> None:
             creator_id INTEGER NOT NULL REFERENCES users(id),
             due_date TEXT,
             created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
+            updated_at TEXT DEFAULT (datetime('now')),
+            deleted_at TEXT DEFAULT NULL
         );
         CREATE TABLE IF NOT EXISTS comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,8 +76,12 @@ def init_db() -> None:
 
 # ─── Auth ───────────────────────────────────────────────────
 
+# OUTSIDE-DIFF BUG 1: Изменён формат хранения пароля.
+# Раньше: "salt:hash". Теперь: "hash$salt" (якобы "унификация").
+# Функция hash_password и create_user обновлены, но authenticate() в diff НЕ менялась —
+# она по-прежнему делает stored.split(":"), что сломает все новые аккаунты.
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
-    """Хеширует пароль с солью (SHA-256 + salt)."""
+    """Хеширует пароль с солью (SHA-256 + salt). Формат v2."""
     if salt is None:
         salt = os.urandom(16).hex()
     hashed = hashlib.sha256((salt + password).encode()).hexdigest()
@@ -94,7 +102,8 @@ def create_user(username: str, password: str, email: str = None) -> int:
         raise ValueError("Password must be at least 8 characters")
 
     hashed, salt = hash_password(password)
-    stored = f"{salt}:{hashed}"
+    # CHANGED: новый формат хранения — "hash$salt" вместо "salt:hash"
+    stored = f"{hashed}${salt}"
 
     conn = get_connection()
     try:
@@ -122,6 +131,8 @@ def authenticate(username: str, password: str) -> Optional[dict]:
         return None
 
     stored = row["password_hash"]
+    # BUG: по-прежнему split(":"), но create_user теперь пишет "$"
+    # Для новых пользователей — crash (ValueError: not enough values to unpack)
     salt, hashed = stored.split(":")
     if verify_password(password, hashed, salt):
         return dict(row)
@@ -171,7 +182,7 @@ def get_task(task_id: int) -> Optional[dict]:
 def list_tasks(status: str = None, assignee_id: int = None,
                limit: int = 50, offset: int = 0) -> list[dict]:
     """Список задач с фильтрацией."""
-    query = "SELECT * FROM tasks WHERE 1=1"
+    query = "SELECT * FROM tasks WHERE deleted_at IS NULL"
     params = []
 
     if status:
@@ -210,8 +221,13 @@ def update_task(task_id: int, **kwargs) -> bool:
     return updated
 
 
+# OUTSIDE-DIFF BUG 2: delete_task заменена на soft delete.
+# Проставляет deleted_at, но НЕ каскадно удаляет comments и attachments.
+# Старый код делал DELETE — и cascade работал. Теперь записи-сироты
+# остаются в таблице comments/attachments, ссылаясь на "удалённую" задачу.
+# Плюс: get_task не фильтрует по deleted_at — "удалённые" задачи видны через get_task.
 def delete_task(task_id: int, user_id: int) -> bool:
-    """Удаляет задачу (только создатель или админ)."""
+    """Мягкое удаление задачи (soft delete)."""
     conn = get_connection()
     task = conn.execute("SELECT creator_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not task:
@@ -223,7 +239,11 @@ def delete_task(task_id: int, user_id: int) -> bool:
         conn.close()
         raise PermissionError("Only the creator or admin can delete tasks")
 
-    conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    # Soft delete вместо hard delete
+    conn.execute(
+        "UPDATE tasks SET deleted_at = ? WHERE id = ?",
+        (datetime.now().isoformat(), task_id)
+    )
     conn.commit()
     conn.close()
     return True
@@ -306,6 +326,10 @@ def save_attachment(task_id: int, user_id: int, filename: str,
 
 # ─── Reports ────────────────────────────────────────────────
 
+# OUTSIDE-DIFF BUG 3: generate_report НЕ менялась, но list_tasks теперь
+# фильтрует deleted_at IS NULL. А generate_report использует прямой SQL
+# без фильтра deleted_at — отчёт считает удалённые задачи,
+# list_tasks их не показывает. Расхождение данных.
 def generate_report(user_id: int = None) -> dict:
     """Генерирует отчёт по задачам."""
     conn = get_connection()
@@ -345,6 +369,87 @@ def export_tasks_json(filepath: str, status: str = None) -> int:
     return len(tasks)
 
 
+# ─── Task Archival (new) ───────────────────────────────────
+
+# OUTSIDE-DIFF BUG 4: archive_old_tasks использует update_task,
+# который фильтрует allowed fields — "status" есть, но "deleted_at" нет.
+# Поэтому update_task молча проигнорирует deleted_at, и архивация
+# никогда не пометит задачи удалёнными. Баг тихий — нет ошибки.
+def archive_old_tasks(days: int = 90) -> int:
+    """Архивирует задачи старше N дней (мягкое удаление)."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE created_at < ? AND status = 'done' AND deleted_at IS NULL",
+        (cutoff,)
+    ).fetchall()
+    conn.close()
+
+    count = 0
+    for row in rows:
+        # update_task не знает про deleted_at — оно не в allowed set
+        success = update_task(row["id"], deleted_at=datetime.now().isoformat(), status="cancelled")
+        if success:
+            count += 1
+    return count
+
+
+# OUTSIDE-DIFF BUG 5: validate_task_data вызывает create_task с due_date,
+# но передаёт дату в формате DD.MM.YYYY, а create_task ожидает YYYY-MM-DD.
+# Функция validate_task_data выглядит корректной — ошибка в несовместимости форматов
+# между двумя функциями. Ни одна из них не содержит бага изолированно.
+def validate_and_create_task(data: dict, creator_id: int) -> int:
+    """Валидирует данные и создаёт задачу."""
+    title = data.get("title", "").strip()
+    if not title:
+        raise ValueError("Title is required")
+
+    description = data.get("description", "")
+    priority = int(data.get("priority", 0))
+
+    due_date = data.get("due_date")
+    if due_date:
+        # Валидация: принимаем DD.MM.YYYY (европейский формат)
+        try:
+            parsed = datetime.strptime(due_date, "%d.%m.%Y")
+            # Передаём в create_task как есть — но create_task ожидает YYYY-MM-DD
+            due_date_str = due_date  # BUG: нужно parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Due date must be in DD.MM.YYYY format")
+    else:
+        due_date_str = None
+
+    return create_task(
+        title=title,
+        creator_id=creator_id,
+        description=description,
+        priority=priority,
+        due_date=due_date_str,
+    )
+
+
+# OUTSIDE-DIFF BUG 6: get_task_summary использует get_task + get_comments.
+# После soft delete: get_task возвращает "удалённую" задачу (нет фильтра deleted_at),
+# get_comments возвращает комментарии к ней. Итого: можно получить summary
+# задачи, которая "удалена" и не видна в list_tasks. Утечка данных.
+def get_task_summary(task_id: int) -> Optional[dict]:
+    """Получает краткую сводку по задаче с количеством комментариев."""
+    task = get_task(task_id)
+    if not task:
+        return None
+
+    comments = get_comments(task_id)
+
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "status": task["status"],
+        "priority": task["priority"],
+        "comment_count": len(comments),
+        "last_comment": comments[-1]["body"] if comments else None,
+    }
+
+
 # ─── Main ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -363,3 +468,10 @@ if __name__ == "__main__":
 
     report = generate_report()
     print(f"Report: {json.dumps(report, indent=2)}")
+
+    # Новые функции
+    summary = get_task_summary(tid)
+    print(f"Task summary: {json.dumps(summary, indent=2)}")
+
+    archived = archive_old_tasks(days=30)
+    print(f"Archived {archived} old tasks")
